@@ -225,10 +225,10 @@ def search_docs(query: str, max_results: int = 3) -> list[dict]:
         return []
 
 
-def get_doc_article(article_id: str) -> str:
-    """Fetch the full text of a Docs article by ID."""
+def get_doc_article(article_id: str) -> dict | None:
+    """Fetch the full text of a Docs article by ID. Returns dict with name, url, text."""
     if not HELPSCOUT_DOCS_API_KEY:
-        return ""
+        return None
 
     try:
         resp = requests.get(
@@ -236,19 +236,20 @@ def get_doc_article(article_id: str) -> str:
             auth=(HELPSCOUT_DOCS_API_KEY, "X"),
         )
         if not resp.ok:
-            return ""
+            return None
         article = resp.json().get("article", {})
         text = article.get("text", "")
         name = article.get("name", "Untitled")
+        url = article.get("publicUrl", "")
         # Strip HTML from article body
         clean_text = strip_html(text)
-        # Truncate very long articles to keep token usage reasonable
-        if len(clean_text) > 3000:
-            clean_text = clean_text[:3000] + "\n...(article truncated)"
-        return f"ARTICLE: {name}\n\n{clean_text}"
+        # Allow more content for richer context
+        if len(clean_text) > 6000:
+            clean_text = clean_text[:6000] + "\n...(article truncated)"
+        return {"name": name, "url": url, "text": clean_text}
     except Exception as e:
         log.warning(f"  Error fetching article {article_id}: {e}")
-        return ""
+        return None
 
 
 def find_relevant_docs(subject: str, thread_history: str) -> str:
@@ -307,15 +308,24 @@ def find_relevant_docs(subject: str, thread_history: str) -> str:
         name = result.get("name", "Untitled")
         url = result.get("url", "no URL")
         log.info(f"    Doc match: \"{name}\" - {url}")
-        article_text = get_doc_article(result["id"])
-        if article_text:
-            articles.append(article_text)
+        article_data = get_doc_article(result["id"])
+        if article_data:
+            articles.append(article_data)
 
     if not articles:
         return ""
 
     log.info(f"  Using {len(articles)} help doc(s) for context.")
-    return "\n\n---\n\n".join(articles)
+
+    # Format with URLs so Claude can link them in the response
+    parts = []
+    for art in articles:
+        parts.append(
+            f"ARTICLE: {art['name']}\n"
+            f"URL: {art['url']}\n\n"
+            f"{art['text']}"
+        )
+    return "\n\n---\n\n".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -433,13 +443,18 @@ def draft_reply_with_claude(
 
     if docs_context:
         user_message += (
-            f"Here are relevant articles from our help documentation that may "
-            f"help you craft an accurate response:\n\n"
+            f"Here are relevant articles from our help documentation. Use the "
+            f"article content as your PRIMARY source for answering. Pull specific "
+            f"steps, details, and instructions directly from these docs.\n\n"
             f"--- HELP DOCS ---\n\n{docs_context}\n\n"
             f"--- END HELP DOCS ---\n\n"
-            f"Use information from these docs when relevant, but do NOT quote "
-            f"them verbatim or say things like 'according to our help docs.' "
-            f"Just use the knowledge naturally.\n\n"
+            f"IMPORTANT instructions for using these docs:\n"
+            f"- Base your answer on the doc content. Be detailed and specific.\n"
+            f"- At the end of your response, link the SINGLE most relevant article "
+            f"naturally, like: \"For more details, check out this guide: [Article Name](URL)\"\n"
+            f"- Only link ONE article, whichever is most helpful for this specific question.\n"
+            f"- Do NOT say things like 'according to our documentation' in the body "
+            f"of your reply. Just use the knowledge naturally, then link at the end.\n\n"
         )
 
     user_message += (
