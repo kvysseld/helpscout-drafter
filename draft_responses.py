@@ -205,7 +205,7 @@ def search_docs(query: str, max_results: int = 3) -> list[dict]:
         return []
 
     try:
-        params: dict = {"query": query, "status": "published"}
+        params: dict = {"query": query, "status": "published", "visibility": "public"}
         if HELPSCOUT_DOCS_SITE_ID:
             params["siteId"] = HELPSCOUT_DOCS_SITE_ID
 
