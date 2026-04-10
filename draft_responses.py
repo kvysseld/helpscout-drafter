@@ -17,9 +17,6 @@ Required env vars:
 Optional env vars:
   HELPSCOUT_DOCS_API_KEY - from Help Scout > Your Profile > Authentication > API Keys
   HELPSCOUT_MAILBOX_ID   - limit to one mailbox
-
-Optional env vars:
-  DRAFT_TAG              - tag added to conversations after drafting (default: "ai-drafted")
   DRY_RUN                - set to "true" to print drafts without posting them
 """
 
@@ -42,7 +39,6 @@ HELPSCOUT_APP_SECRET = os.environ["HELPSCOUT_APP_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HELPSCOUT_DOCS_API_KEY = os.environ.get("HELPSCOUT_DOCS_API_KEY", "")
 MAILBOX_ID = os.environ.get("HELPSCOUT_MAILBOX_ID", "")
-DRAFT_TAG = os.environ.get("DRAFT_TAG", "ai-drafted")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 HS_BASE = "https://api.helpscout.net/v2"
@@ -177,20 +173,6 @@ def hs_post(path: str, payload: dict) -> requests.Response:
     return resp
 
 
-def hs_put(path: str, payload: dict) -> requests.Response:
-    """Authenticated PUT against the Help Scout API."""
-    token = get_hs_token()
-    resp = requests.put(
-        f"{HS_BASE}{path}",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-    )
-    resp.raise_for_status()
-    return resp
-
 
 # ---------------------------------------------------------------------------
 # Help Scout Docs API (separate API, uses Basic Auth with a Docs API key)
@@ -277,6 +259,9 @@ def find_relevant_docs(subject: str, thread_history: str) -> str:
     # Fetch full article text for top results
     articles = []
     for result in search_results[:3]:
+        name = result.get("name", "Untitled")
+        url = result.get("url", "no URL")
+        log.info(f"    Doc match: \"{name}\" - {url}")
         article_text = get_doc_article(result["id"])
         if article_text:
             articles.append(article_text)
@@ -284,7 +269,7 @@ def find_relevant_docs(subject: str, thread_history: str) -> str:
     if not articles:
         return ""
 
-    log.info(f"  Found {len(articles)} relevant help doc(s).")
+    log.info(f"  Using {len(articles)} help doc(s) for context.")
     return "\n\n---\n\n".join(articles)
 
 
@@ -309,9 +294,8 @@ def get_my_user_id() -> int:
 
 def get_conversations_needing_reply() -> list[dict]:
     """
-    Return active conversations ASSIGNED TO ME where the most recent thread
-    was from a customer (i.e. waiting on us to reply) and that have NOT
-    already been drafted by this script.
+    Return active conversations ASSIGNED TO ME where the customer replied
+    within the last 24 hours and is waiting on a response.
     """
     my_id = get_my_user_id()
 
@@ -322,6 +306,7 @@ def get_conversations_needing_reply() -> list[dict]:
     data = hs_get("/conversations", params)
     conversations = data.get("_embedded", {}).get("conversations", [])
 
+    now = datetime.now(timezone.utc)
     needs_reply = []
     for convo in conversations:
         # Only process conversations assigned to me
@@ -329,12 +314,21 @@ def get_conversations_needing_reply() -> list[dict]:
         if not assignee or assignee.get("id") != my_id:
             continue
 
-        tags = [t.get("tag", "") if isinstance(t, dict) else t for t in convo.get("tags", [])]
-        if DRAFT_TAG in tags:
-            continue  # already drafted
         # Check if customer is waiting
-        if convo.get("customerWaitingSince", {}).get("time"):
-            needs_reply.append(convo)
+        waiting_since = convo.get("customerWaitingSince", {}).get("time")
+        if not waiting_since:
+            continue
+
+        # Only include if the customer replied within the last 24 hours
+        try:
+            waiting_dt = datetime.fromisoformat(waiting_since.replace("Z", "+00:00"))
+            hours_waiting = (now - waiting_dt).total_seconds() / 3600
+            if hours_waiting > 24:
+                continue
+        except (ValueError, TypeError):
+            continue
+
+        needs_reply.append(convo)
 
     return needs_reply
 
@@ -441,12 +435,6 @@ def post_note(conversation_id: int, text: str) -> None:
     log.info(f"  Posted note on conversation {conversation_id}")
 
 
-def tag_conversation(conversation_id: int, existing_tags: list[str]) -> None:
-    """Add the DRAFT_TAG so we don't re-draft the same conversation."""
-    all_tags = list(set(existing_tags + [DRAFT_TAG]))
-    hs_put(f"/conversations/{conversation_id}/tags", {"tags": all_tags})
-    log.info(f"  Tagged conversation {conversation_id} with '{DRAFT_TAG}'")
-
 
 def run() -> None:
     log.info("Starting Help Scout auto-drafter...")
@@ -493,11 +481,6 @@ def run() -> None:
                 print()
             else:
                 post_note(convo_id, draft)
-                existing_tags = [
-                    t.get("tag", "") if isinstance(t, dict) else t
-                    for t in convo.get("tags", [])
-                ]
-                tag_conversation(convo_id, existing_tags)
 
         except Exception as e:
             log.error(f"  Error processing conversation {convo_id}: {e}")
