@@ -13,7 +13,10 @@ Required env vars:
   HELPSCOUT_APP_ID       - from Help Scout > Your Profile > My Apps
   HELPSCOUT_APP_SECRET   - same place
   ANTHROPIC_API_KEY      - from console.anthropic.com
-  HELPSCOUT_MAILBOX_ID   - (optional) limit to one mailbox
+
+Optional env vars:
+  HELPSCOUT_DOCS_API_KEY - from Help Scout > Your Profile > Authentication > API Keys
+  HELPSCOUT_MAILBOX_ID   - limit to one mailbox
 
 Optional env vars:
   DRAFT_TAG              - tag added to conversations after drafting (default: "ai-drafted")
@@ -37,11 +40,13 @@ import requests
 HELPSCOUT_APP_ID = os.environ["HELPSCOUT_APP_ID"]
 HELPSCOUT_APP_SECRET = os.environ["HELPSCOUT_APP_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+HELPSCOUT_DOCS_API_KEY = os.environ.get("HELPSCOUT_DOCS_API_KEY", "")
 MAILBOX_ID = os.environ.get("HELPSCOUT_MAILBOX_ID", "")
 DRAFT_TAG = os.environ.get("DRAFT_TAG", "ai-drafted")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 HS_BASE = "https://api.helpscout.net/v2"
+DOCS_BASE = "https://docsapi.helpscout.net/v1"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
@@ -145,6 +150,102 @@ def hs_put(path: str, payload: dict) -> requests.Response:
 
 
 # ---------------------------------------------------------------------------
+# Help Scout Docs API (separate API, uses Basic Auth with a Docs API key)
+# ---------------------------------------------------------------------------
+def search_docs(query: str, max_results: int = 3) -> list[dict]:
+    """Search Help Scout Docs for articles matching the query."""
+    if not HELPSCOUT_DOCS_API_KEY:
+        return []
+
+    try:
+        resp = requests.get(
+            f"{DOCS_BASE}/search/articles",
+            params={"query": query, "status": "published"},
+            auth=(HELPSCOUT_DOCS_API_KEY, "X"),
+        )
+        if not resp.ok:
+            log.warning(f"  Docs search failed ({resp.status_code}): {resp.text[:200]}")
+            return []
+        data = resp.json()
+        items = data.get("articles", {}).get("items", [])
+        return items[:max_results]
+    except Exception as e:
+        log.warning(f"  Docs search error: {e}")
+        return []
+
+
+def get_doc_article(article_id: str) -> str:
+    """Fetch the full text of a Docs article by ID."""
+    if not HELPSCOUT_DOCS_API_KEY:
+        return ""
+
+    try:
+        resp = requests.get(
+            f"{DOCS_BASE}/articles/{article_id}",
+            auth=(HELPSCOUT_DOCS_API_KEY, "X"),
+        )
+        if not resp.ok:
+            return ""
+        article = resp.json().get("article", {})
+        text = article.get("text", "")
+        name = article.get("name", "Untitled")
+        # Strip HTML from article body
+        clean_text = strip_html(text)
+        # Truncate very long articles to keep token usage reasonable
+        if len(clean_text) > 3000:
+            clean_text = clean_text[:3000] + "\n...(article truncated)"
+        return f"ARTICLE: {name}\n\n{clean_text}"
+    except Exception as e:
+        log.warning(f"  Error fetching article {article_id}: {e}")
+        return ""
+
+
+def find_relevant_docs(subject: str, thread_history: str) -> str:
+    """
+    Search Help Scout Docs using keywords from the conversation.
+    Returns formatted article text to include in Claude's prompt.
+    """
+    if not HELPSCOUT_DOCS_API_KEY:
+        log.info("  No Docs API key set, skipping docs lookup.")
+        return ""
+
+    # Search using the subject line first (usually most descriptive)
+    search_results = search_docs(subject)
+
+    # If subject didn't find much, also try keywords from the last customer message
+    if len(search_results) < 2:
+        # Grab the last ~200 chars of thread history as a fallback search
+        last_chunk = thread_history[-500:] if len(thread_history) > 500 else thread_history
+        # Extract a rough search query from it (first 100 chars, no special chars)
+        fallback_query = re.sub(r"[^a-zA-Z0-9 ]", " ", last_chunk[:150]).strip()
+        if fallback_query:
+            extra = search_docs(fallback_query, max_results=2)
+            # Deduplicate by article ID
+            seen_ids = {r["id"] for r in search_results}
+            for item in extra:
+                if item["id"] not in seen_ids:
+                    search_results.append(item)
+                    seen_ids.add(item["id"])
+
+    if not search_results:
+        log.info("  No relevant docs found.")
+        return ""
+
+    # Fetch full article text for top results
+    articles = []
+    for result in search_results[:3]:
+        article_text = get_doc_article(result["id"])
+        if article_text:
+            articles.append(article_text)
+
+    if not articles:
+        return ""
+
+    log.info(f"  Found {len(articles)} relevant help doc(s).")
+    return "\n\n---\n\n".join(articles)
+
+
+# ---------------------------------------------------------------------------
 # Core logic
 # ---------------------------------------------------------------------------
 def strip_html(text: str) -> str:
@@ -225,12 +326,26 @@ def get_thread_history(conversation_id: int) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def draft_reply_with_claude(subject: str, thread_history: str) -> str:
+def draft_reply_with_claude(subject: str, thread_history: str, docs_context: str = "") -> str:
     """Send the conversation to Claude and get a draft reply."""
     user_message = (
         f"Here is a Help Scout support conversation. The subject line is: \"{subject}\"\n\n"
         f"--- CONVERSATION HISTORY ---\n\n{thread_history}\n\n"
         f"--- END ---\n\n"
+    )
+
+    if docs_context:
+        user_message += (
+            f"Here are relevant articles from our help documentation that may "
+            f"help you craft an accurate response:\n\n"
+            f"--- HELP DOCS ---\n\n{docs_context}\n\n"
+            f"--- END HELP DOCS ---\n\n"
+            f"Use information from these docs when relevant, but do NOT quote "
+            f"them verbatim or say things like 'according to our help docs.' "
+            f"Just use the knowledge naturally.\n\n"
+        )
+
+    user_message += (
         f"Please draft a reply to the customer's most recent message. "
         f"Write ONLY the reply body, nothing else."
     )
@@ -294,7 +409,10 @@ def run() -> None:
                 log.warning(f"  No usable threads found, skipping.")
                 continue
 
-            draft = draft_reply_with_claude(subject, history)
+            # Search help docs for relevant articles
+            docs_context = find_relevant_docs(subject, history)
+
+            draft = draft_reply_with_claude(subject, history, docs_context)
             if not draft:
                 log.warning(f"  Claude returned empty draft, skipping.")
                 continue
