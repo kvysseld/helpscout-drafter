@@ -2,9 +2,9 @@ name: Draft Help Scout Replies
 
 on:
   schedule:
-    # Runs at 10:00 UTC every weekday (that's 6:00 AM Eastern)
+    # Runs at 13:000 UTC every weekday (that's 9:00 AM Eastern)
     # Adjust the hour if you want it earlier/later
-    - cron: '0 10 * * 1-5'
+    - cron: '0 13 * * 1-5'
   workflow_dispatch:  # This adds a manual "Run" button in the GitHub UI
 
 jobs:
@@ -28,3 +28,4 @@ jobs:
           HELPSCOUT_APP_ID: ${{ secrets.HELPSCOUT_APP_ID }}
           HELPSCOUT_APP_SECRET: ${{ secrets.HELPSCOUT_APP_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HELPSCOUT_DOCS_API_KEY: ${{ secrets.HELPSCOUT_DOCS_API_KEY }}
