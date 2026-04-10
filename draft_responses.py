@@ -444,7 +444,7 @@ def post_note(conversation_id: int, text: str) -> None:
 def tag_conversation(conversation_id: int, existing_tags: list[str]) -> None:
     """Add the DRAFT_TAG so we don't re-draft the same conversation."""
     all_tags = list(set(existing_tags + [DRAFT_TAG]))
-    hs_put(f"/conversations/{conversation_id}", {"op": "replace", "path": "/tags", "value": all_tags})
+    hs_put(f"/conversations/{conversation_id}/tags", {"tags": all_tags})
     log.info(f"  Tagged conversation {conversation_id} with '{DRAFT_TAG}'")
 
 
