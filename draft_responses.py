@@ -173,7 +173,6 @@ def get_conversations_needing_reply() -> list[dict]:
         "status": "active",
         "sortField": "customerWaitingSince",
         "sortOrder": "desc",
-        "query": f"(assignedTo:{my_id})",
     }
     if MAILBOX_ID:
         params["mailbox"] = MAILBOX_ID
@@ -183,6 +182,11 @@ def get_conversations_needing_reply() -> list[dict]:
 
     needs_reply = []
     for convo in conversations:
+        # Only process conversations assigned to me
+        assignee = convo.get("assignee")
+        if not assignee or assignee.get("id") != my_id:
+            continue
+
         tags = [t.get("tag", "") if isinstance(t, dict) else t for t in convo.get("tags", [])]
         if DRAFT_TAG in tags:
             continue  # already drafted
