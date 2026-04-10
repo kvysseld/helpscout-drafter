@@ -108,7 +108,9 @@ def hs_get(path: str, params: dict | None = None) -> dict:
         headers={"Authorization": f"Bearer {token}"},
         params=params or {},
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        log.error(f"Help Scout API error {resp.status_code}: {resp.text}")
+        resp.raise_for_status()
     return resp.json()
 
 
@@ -169,11 +171,7 @@ def get_conversations_needing_reply() -> list[dict]:
     """
     my_id = get_my_user_id()
 
-    params: dict = {
-        "status": "active",
-        "sortField": "customerWaitingSince",
-        "sortOrder": "desc",
-    }
+    params: dict = {"status": "active"}
     if MAILBOX_ID:
         params["mailbox"] = MAILBOX_ID
 
