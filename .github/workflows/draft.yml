@@ -2,7 +2,7 @@ name: Draft Help Scout Replies
 
 on:
   schedule:
-    # Runs at 13:000 UTC every weekday (that's 9:00 AM Eastern)
+    # Runs at 13:00 UTC every weekday (that's 9:00 AM Eastern)
     # Adjust the hour if you want it earlier/later
     - cron: '0 13 * * 1-5'
   workflow_dispatch:  # This adds a manual "Run" button in the GitHub UI
