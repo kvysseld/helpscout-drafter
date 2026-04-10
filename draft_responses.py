@@ -38,6 +38,7 @@ HELPSCOUT_APP_ID = os.environ["HELPSCOUT_APP_ID"]
 HELPSCOUT_APP_SECRET = os.environ["HELPSCOUT_APP_SECRET"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 HELPSCOUT_DOCS_API_KEY = os.environ.get("HELPSCOUT_DOCS_API_KEY", "")
+HELPSCOUT_DOCS_SITE_ID = os.environ.get("HELPSCOUT_DOCS_SITE_ID", "")
 MAILBOX_ID = os.environ.get("HELPSCOUT_MAILBOX_ID", "")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
@@ -176,6 +177,27 @@ def hs_post(path: str, payload: dict) -> requests.Response:
 
 # ---------------------------------------------------------------------------
 # Help Scout Docs API (separate API, uses Basic Auth with a Docs API key)
+def list_docs_sites() -> None:
+    """Log all available Docs sites so the user can find the right site ID."""
+    if not HELPSCOUT_DOCS_API_KEY:
+        return
+    try:
+        resp = requests.get(
+            f"{DOCS_BASE}/sites",
+            auth=(HELPSCOUT_DOCS_API_KEY, "X"),
+        )
+        if resp.ok:
+            sites = resp.json().get("sites", {}).get("items", [])
+            if sites:
+                log.info("Available Docs sites:")
+                for site in sites:
+                    log.info(f"    ID: {site.get('id')}  |  Name: \"{site.get('title', 'Untitled')}\"  |  URL: {site.get('subDomain', 'n/a')}")
+                if not HELPSCOUT_DOCS_SITE_ID:
+                    log.warning("  No HELPSCOUT_DOCS_SITE_ID set. Searching ALL sites. Set it to limit to one product.")
+    except Exception as e:
+        log.warning(f"  Could not list Docs sites: {e}")
+
+
 # ---------------------------------------------------------------------------
 def search_docs(query: str, max_results: int = 3) -> list[dict]:
     """Search Help Scout Docs for articles matching the query."""
@@ -183,9 +205,13 @@ def search_docs(query: str, max_results: int = 3) -> list[dict]:
         return []
 
     try:
+        params: dict = {"query": query, "status": "published"}
+        if HELPSCOUT_DOCS_SITE_ID:
+            params["siteId"] = HELPSCOUT_DOCS_SITE_ID
+
         resp = requests.get(
             f"{DOCS_BASE}/search/articles",
-            params={"query": query, "status": "published"},
+            params=params,
             auth=(HELPSCOUT_DOCS_API_KEY, "X"),
         )
         if not resp.ok:
@@ -459,6 +485,9 @@ def run() -> None:
     log.info("Starting Help Scout auto-drafter...")
     if DRY_RUN:
         log.info("DRY RUN mode -- drafts will be printed, not posted.")
+
+    # Log available Docs sites (helps identify the right site ID)
+    list_docs_sites()
 
     conversations = get_conversations_needing_reply()
     log.info(f"Found {len(conversations)} conversations needing a reply.")
