@@ -227,30 +227,49 @@ def get_doc_article(article_id: str) -> str:
 
 def find_relevant_docs(subject: str, thread_history: str) -> str:
     """
-    Search Help Scout Docs using keywords from the conversation.
+    Search Help Scout Docs using the customer's latest message.
     Returns formatted article text to include in Claude's prompt.
     """
     if not HELPSCOUT_DOCS_API_KEY:
         log.info("  No Docs API key set, skipping docs lookup.")
         return ""
 
-    # Search using the subject line first (usually most descriptive)
-    search_results = search_docs(subject)
+    # Extract the last customer message from the thread history
+    # (thread history format: [CUSTOMER - Name - Date]\nmessage text)
+    last_customer_msg = ""
+    blocks = thread_history.split("\n\n---\n\n")
+    for block in reversed(blocks):
+        if block.strip().startswith("[CUSTOMER"):
+            # Grab just the message body (skip the header line)
+            lines = block.strip().split("\n", 1)
+            if len(lines) > 1:
+                last_customer_msg = lines[1].strip()
+            break
 
-    # If subject didn't find much, also try keywords from the last customer message
-    if len(search_results) < 2:
-        # Grab the last ~200 chars of thread history as a fallback search
-        last_chunk = thread_history[-500:] if len(thread_history) > 500 else thread_history
-        # Extract a rough search query from it (first 100 chars, no special chars)
-        fallback_query = re.sub(r"[^a-zA-Z0-9 ]", " ", last_chunk[:150]).strip()
-        if fallback_query:
-            extra = search_docs(fallback_query, max_results=2)
-            # Deduplicate by article ID
-            seen_ids = {r["id"] for r in search_results}
-            for item in extra:
+    # Build search queries: prioritize the actual customer message
+    search_results = []
+    seen_ids: set = set()
+
+    # Primary search: customer's latest message (first 150 chars, cleaned)
+    if last_customer_msg:
+        msg_query = re.sub(r"[^a-zA-Z0-9 ]", " ", last_customer_msg[:150]).strip()
+        if msg_query:
+            log.info(f"    Searching docs for: \"{msg_query[:80]}...\"")
+            results = search_docs(msg_query)
+            for item in results:
                 if item["id"] not in seen_ids:
                     search_results.append(item)
                     seen_ids.add(item["id"])
+
+    # Secondary search: subject line (if it looks meaningful, not "This is a test" etc.)
+    subject_clean = re.sub(r"[^a-zA-Z0-9 ]", " ", subject).strip()
+    generic_subjects = {"test", "this is a test", "help", "question", "hi", "hello", "hey"}
+    if subject_clean.lower() not in generic_subjects and len(subject_clean) > 5:
+        results = search_docs(subject_clean, max_results=2)
+        for item in results:
+            if item["id"] not in seen_ids:
+                search_results.append(item)
+                seen_ids.add(item["id"])
 
     if not search_results:
         log.info("  No relevant docs found.")
