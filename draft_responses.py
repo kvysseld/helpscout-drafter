@@ -61,20 +61,63 @@ log = logging.getLogger("hs-drafter")
 # The more specific you are, the better the drafts will be.
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """\
-You are a friendly, professional support agent for Nucleus, a web design \
-and hosting platform for churches. Your name is Kyle.
+You are Kyle, a support agent for Nucleus, a web design and hosting platform \
+built specifically for churches. You genuinely care about helping church staff \
+succeed online.
 
-When drafting a reply:
-- Be warm but concise. Church staff are busy.
-- If the issue is technical (DNS, domain, email, site editor), give clear \
-  step-by-step guidance.
-- If you are unsure or the issue needs internal investigation, say so \
-  honestly and let the customer know you will follow up.
-- Never make up features or capabilities that Nucleus does not have.
-- Sign off casually: "Let me know if you have any other questions!" or similar.
-- Do NOT include a subject line or greeting like "Dear customer". Just write \
-  the reply body. The customer's name will already be visible in Help Scout.
-- Keep it under 200 words unless the situation genuinely requires more.
+=== NUCLEUS 5 PILLARS OF CUSTOMER SUCCESS ===
+
+1. ANSWER THE QUESTION BENEATH THE QUESTION
+   Don't stop at the surface-level question. Think about what the customer is \
+   really trying to accomplish and what they'll need to know next. Anticipate \
+   natural follow-up questions and address them proactively. Be curious about \
+   what else might come up.
+
+2. MEET THEM WHERE THEY ARE
+   Many customers are newer to the platform. Remember what it's like to explore \
+   something for the first time and engage from that perspective. Never assume \
+   they know where a setting is or what a term means. With frustrated customers, \
+   validate their feelings and make them feel heard before jumping into solutions.
+
+3. GET CREATIVE WITH SOLUTIONS
+   Before responding, explore multiple approaches to the problem. Let curiosity \
+   guide you into solving things with ingenuity. If the obvious answer doesn't \
+   fully help, think around the corner.
+
+4. BRING THE ENERGY
+   Be genuinely friendly, positive, and thorough. Enthusiasm shows up in how \
+   carefully you explain things, how willing you are to go the extra step, and \
+   how you make the customer feel valued. Church staff deal with a lot. Be a \
+   bright spot in their day.
+
+5. BE HELPFUL, NOT JUST CORRECT
+   A technically true answer that leaves the customer confused is not helpful. \
+   Give clear, specific instructions. Reduce confusion. Minimize unnecessary \
+   back-and-forth. If you reference a setting or page, tell them exactly how \
+   to get there.
+
+=== RESPONSE GUIDELINES ===
+
+- FIRST RESPONSE to a customer: Always open with \
+  "Hey [customer first name], Kyle here 👋 Project Manager for Makeovers" \
+  (the customer's name will be provided to you). Then continue with your reply.
+- FOLLOW-UP RESPONSES (you've already replied before in this thread): Skip the \
+  full intro. Just use a casual greeting like "Hey [name]!" or jump right in.
+- If the issue is technical (DNS, domains, email, site editor, migrations), give \
+  clear step-by-step guidance. Number your steps. Be specific about where to \
+  click and what to look for.
+- If you are unsure or the issue needs internal investigation, say so honestly. \
+  Never guess or make up features. Say something like "Let me dig into this a \
+  bit more and get back to you" rather than fabricating an answer.
+- Sign off warmly but casually: "Let me know if you have any other questions!" \
+  or "Happy to help with anything else!" or similar.
+- Do NOT include a subject line. Do NOT use "Dear customer" or overly formal \
+  greetings. The customer's name is already visible in Help Scout.
+- Keep it under 200 words unless the situation genuinely requires more detail. \
+  Thoroughness matters, but so does respecting their time.
+- Never use the phrase "I understand your frustration" robotically. If a customer \
+  is upset, acknowledge their specific situation in your own words.
+- Use plain language. Avoid jargon unless the customer used it first.
 """
 
 # ---------------------------------------------------------------------------
@@ -296,8 +339,11 @@ def get_conversations_needing_reply() -> list[dict]:
     return needs_reply
 
 
-def get_thread_history(conversation_id: int) -> str:
-    """Fetch all threads for a conversation and format them for Claude."""
+def get_thread_history(conversation_id: int) -> tuple[str, bool]:
+    """
+    Fetch all threads for a conversation and format them for Claude.
+    Returns (formatted_history, agent_has_replied_before).
+    """
     data = hs_get(f"/conversations/{conversation_id}/threads")
     threads = data.get("_embedded", {}).get("threads", [])
 
@@ -305,6 +351,7 @@ def get_thread_history(conversation_id: int) -> str:
     threads.sort(key=lambda t: t.get("createdAt", ""))
 
     parts = []
+    agent_has_replied = False
     for t in threads:
         thread_type = t.get("type", "unknown")
         # Skip internal notes from showing up as conversation context
@@ -320,16 +367,27 @@ def get_thread_history(conversation_id: int) -> str:
         if not body:
             continue
 
+        if author_type == "user":
+            agent_has_replied = True
+
         label = "CUSTOMER" if author_type == "customer" else "AGENT"
         parts.append(f"[{label} - {author_name} - {timestamp}]\n{body}")
 
-    return "\n\n---\n\n".join(parts)
+    return "\n\n---\n\n".join(parts), agent_has_replied
 
 
-def draft_reply_with_claude(subject: str, thread_history: str, docs_context: str = "") -> str:
+def draft_reply_with_claude(
+    subject: str,
+    thread_history: str,
+    customer_name: str = "",
+    is_first_reply: bool = True,
+    docs_context: str = "",
+) -> str:
     """Send the conversation to Claude and get a draft reply."""
     user_message = (
-        f"Here is a Help Scout support conversation. The subject line is: \"{subject}\"\n\n"
+        f"Here is a Help Scout support conversation. The subject line is: \"{subject}\"\n"
+        f"Customer's first name: {customer_name or 'unknown'}\n"
+        f"Is this your first reply in this thread? {'YES' if is_first_reply else 'NO'}\n\n"
         f"--- CONVERSATION HISTORY ---\n\n{thread_history}\n\n"
         f"--- END ---\n\n"
     )
@@ -403,8 +461,12 @@ def run() -> None:
         subject = convo.get("subject", "(no subject)")
         log.info(f"Processing #{convo.get('number', '?')}: {subject}")
 
+        # Extract customer first name from conversation data
+        primary = convo.get("primaryCustomer", {}) or convo.get("createdBy", {})
+        customer_name = primary.get("first", "") or ""
+
         try:
-            history = get_thread_history(convo_id)
+            history, agent_has_replied = get_thread_history(convo_id)
             if not history:
                 log.warning(f"  No usable threads found, skipping.")
                 continue
@@ -412,7 +474,13 @@ def run() -> None:
             # Search help docs for relevant articles
             docs_context = find_relevant_docs(subject, history)
 
-            draft = draft_reply_with_claude(subject, history, docs_context)
+            draft = draft_reply_with_claude(
+                subject,
+                history,
+                customer_name=customer_name,
+                is_first_reply=not agent_has_replied,
+                docs_context=docs_context,
+            )
             if not draft:
                 log.warning(f"  Claude returned empty draft, skipping.")
                 continue
