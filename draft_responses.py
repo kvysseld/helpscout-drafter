@@ -75,8 +75,8 @@ def call_claude(messages: list[dict], system: str = "", max_tokens: int = 1024) 
             json=payload,
         )
         if resp.status_code == 429:
-            wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
-            log.warning(f"  Rate limited by Anthropic API, waiting {wait}s (attempt {attempt+1}/5)...")
+            wait = 15 * (attempt + 1)  # 15, 30, 45, 60, 75 seconds
+            log.warning(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/5)...")
             time.sleep(wait)
             continue
         resp.raise_for_status()
@@ -283,20 +283,29 @@ def find_best_saved_reply(thread_history: str, saved_replies: list[dict]) -> dic
     if not saved_replies:
         return None
 
-    # Build a numbered list of saved reply names + previews for Claude
+    # Extract just the last customer message (not full history) to save tokens
+    last_customer_msg = ""
+    blocks = thread_history.split("\n\n---\n\n")
+    for block in reversed(blocks):
+        if block.strip().startswith("[CUSTOMER"):
+            lines = block.strip().split("\n", 1)
+            if len(lines) > 1:
+                last_customer_msg = lines[1].strip()[:500]
+            break
+
+    if not last_customer_msg:
+        return None
+
+    # Send only saved reply NAMES (not previews) to minimize tokens
     reply_list = ""
     for i, r in enumerate(saved_replies):
         name = r.get("name", "Untitled")
-        preview = r.get("preview", "")[:150]
-        reply_list += f"{i+1}. \"{name}\" - {preview}\n"
+        reply_list += f"{i+1}. {name}\n"
 
     prompt = (
-        f"Here is a customer support conversation:\n\n"
-        f"{thread_history}\n\n"
-        f"Below is a numbered list of saved replies available. Pick the ONE saved "
-        f"reply that BEST answers the customer's latest question. If NONE of them "
-        f"are a good fit, respond with just the word NONE.\n\n"
-        f"Respond with ONLY the number of the best match, or NONE. Nothing else.\n\n"
+        f"Customer's question:\n{last_customer_msg}\n\n"
+        f"Pick the ONE saved reply that BEST answers this question. "
+        f"If NONE fit, respond NONE. Respond with ONLY the number or NONE.\n\n"
         f"{reply_list}"
     )
 
@@ -656,10 +665,6 @@ def run() -> None:
     if DRY_RUN:
         log.info("DRY RUN mode -- drafts will be printed, not posted.")
 
-    # Log available mailboxes and Docs sites (helps with setup)
-    list_mailboxes()
-    list_docs_sites()
-
     # Load saved replies once at startup
     saved_replies = load_saved_replies()
 
@@ -732,8 +737,8 @@ def run() -> None:
             log.error(f"  Error processing conversation {convo_id}: {e}")
             continue
 
-        # Small delay between conversations to avoid rate limits
-        time.sleep(2)
+        # Delay between conversations to avoid rate limits
+        time.sleep(10)
 
     log.info("Done.")
 
