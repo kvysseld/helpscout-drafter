@@ -16,18 +16,16 @@ Required env vars:
 
 Optional env vars:
   HELPSCOUT_DOCS_API_KEY - from Help Scout > Your Profile > Authentication > API Keys
-  HELPSCOUT_MAILBOX_ID   - limit to one mailbox
+  HELPSCOUT_DOCS_SITE_ID - limit docs search to one site (e.g. Nucleus 2)
+  HELPSCOUT_MAILBOX_ID   - required for saved replies
   DRY_RUN                - set to "true" to print drafts without posting them
 """
 
 import os
-import sys
-import json
 import time
 import logging
 import html
 import re
-from datetime import datetime, timezone
 
 import requests
 
@@ -47,48 +45,6 @@ DOCS_BASE = "https://docsapi.helpscout.net/v1"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
-
-# ---------------------------------------------------------------------------
-# Anthropic API helper with retry logic for rate limits
-# ---------------------------------------------------------------------------
-def call_claude(messages: list[dict], system: str = "", max_tokens: int = 1024) -> str:
-    """
-    Call the Anthropic API with automatic retry on 429 rate limit errors.
-    Returns the text content from Claude's response.
-    """
-    payload: dict = {
-        "model": CLAUDE_MODEL,
-        "max_tokens": max_tokens,
-        "messages": messages,
-    }
-    if system:
-        payload["system"] = system
-
-    for attempt in range(5):
-        resp = requests.post(
-            ANTHROPIC_URL,
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
-        if resp.status_code == 429:
-            wait = 15 * (attempt + 1)  # 15, 30, 45, 60, 75 seconds
-            log.warning(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/5)...")
-            time.sleep(wait)
-            continue
-        resp.raise_for_status()
-        data = resp.json()
-        return "".join(
-            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
-        ).strip()
-
-    # If all retries failed
-    log.error("  Exhausted all retries for Anthropic API.")
-    return ""
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -96,8 +52,7 @@ logging.basicConfig(
 log = logging.getLogger("hs-drafter")
 
 # ---------------------------------------------------------------------------
-# Customize this system prompt to match YOUR voice and your company's context.
-# The more specific you are, the better the drafts will be.
+# System prompt
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """\
 You are Kyle, a support agent for Nucleus, a web design and hosting platform \
@@ -163,6 +118,44 @@ succeed online.
 """
 
 # ---------------------------------------------------------------------------
+# Anthropic API helper with retry logic
+# ---------------------------------------------------------------------------
+def call_claude(messages: list[dict], system: str = "", max_tokens: int = 1024) -> str:
+    """Call the Anthropic API with automatic retry on 429 rate limit errors."""
+    payload: dict = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if system:
+        payload["system"] = system
+
+    for attempt in range(5):
+        resp = requests.post(
+            ANTHROPIC_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code == 429:
+            wait = 15 * (attempt + 1)
+            log.warning(f"  Rate limited, waiting {wait}s (attempt {attempt+1}/5)...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return "".join(
+            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+        ).strip()
+
+    log.error("  Exhausted all retries for Anthropic API.")
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Help Scout auth + helpers
 # ---------------------------------------------------------------------------
 _token_cache: dict = {}
@@ -219,45 +212,41 @@ def hs_post(path: str, payload: dict) -> requests.Response:
     return resp
 
 
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
+def strip_html(text: str) -> str:
+    """Rough HTML-to-plain-text conversion."""
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</(p|div|li|tr)>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    return html.unescape(text).strip()
+
+
+def extract_last_customer_message(thread_history: str) -> str:
+    """Pull the most recent customer message from formatted thread history."""
+    blocks = thread_history.split("\n\n---\n\n")
+    for block in reversed(blocks):
+        if block.strip().startswith("[CUSTOMER"):
+            lines = block.strip().split("\n", 1)
+            if len(lines) > 1:
+                return lines[1].strip()
+    return ""
+
 
 # ---------------------------------------------------------------------------
 # Saved Replies
 # ---------------------------------------------------------------------------
-_saved_replies_cache: list[dict] = []
-
-
-def list_mailboxes() -> None:
-    """Log all available mailboxes so the user can find the right mailbox ID."""
-    try:
-        data = hs_get("/mailboxes")
-        mailboxes = data.get("_embedded", {}).get("mailboxes", [])
-        if mailboxes:
-            log.info("Available mailboxes:")
-            for mb in mailboxes:
-                log.info(f"    ID: {mb.get('id')}  |  Name: \"{mb.get('name')}\"  |  Email: {mb.get('email', 'n/a')}")
-            if not MAILBOX_ID:
-                log.warning("  No HELPSCOUT_MAILBOX_ID set. Saved replies require a mailbox ID.")
-    except Exception as e:
-        log.warning(f"  Could not list mailboxes: {e}")
-
-
 def load_saved_replies() -> list[dict]:
-    """
-    Fetch all saved replies for the configured mailbox.
-    Returns list of {id, name, preview}.
-    """
-    global _saved_replies_cache
+    """Fetch all saved replies for the configured mailbox."""
     if not MAILBOX_ID:
         log.info("  No MAILBOX_ID set, skipping saved replies.")
         return []
-
     try:
         data = hs_get(f"/mailboxes/{MAILBOX_ID}/saved-replies")
-        # The response is a direct list, not embedded
         replies = data if isinstance(data, list) else data.get("_embedded", {}).get("saved-replies", data)
         if not isinstance(replies, list):
             replies = []
-        _saved_replies_cache = replies
         log.info(f"Loaded {len(replies)} saved replies.")
         return replies
     except Exception as e:
@@ -266,111 +255,57 @@ def load_saved_replies() -> list[dict]:
 
 
 def get_saved_reply_full(reply_id: int) -> str:
-    """Fetch the full HTML body of a saved reply and return as plain text."""
+    """Fetch the full body of a saved reply as plain text."""
     if not MAILBOX_ID:
         return ""
     try:
         data = hs_get(f"/mailboxes/{MAILBOX_ID}/saved-replies/{reply_id}")
-        html_text = data.get("text", "")
-        return strip_html(html_text)
+        return strip_html(data.get("text", ""))
     except Exception as e:
         log.warning(f"  Could not fetch saved reply {reply_id}: {e}")
         return ""
 
 
-def find_best_saved_reply(thread_history: str, saved_replies: list[dict]) -> dict | None:
-    """
-    Use Claude to pick the best saved reply for this conversation.
-    Returns the saved reply dict if a good match is found, or None.
-    """
-    if not saved_replies:
+def find_best_saved_reply(customer_message: str, saved_replies: list[dict]) -> dict | None:
+    """Use Claude to pick the best saved reply for the customer's question."""
+    if not saved_replies or not customer_message:
         return None
 
-    # Extract just the last customer message (not full history) to save tokens
-    last_customer_msg = ""
-    blocks = thread_history.split("\n\n---\n\n")
-    for block in reversed(blocks):
-        if block.strip().startswith("[CUSTOMER"):
-            lines = block.strip().split("\n", 1)
-            if len(lines) > 1:
-                last_customer_msg = lines[1].strip()[:500]
-            break
-
-    if not last_customer_msg:
-        return None
-
-    # Send only saved reply NAMES (not previews) to minimize tokens
-    reply_list = ""
-    for i, r in enumerate(saved_replies):
-        name = r.get("name", "Untitled")
-        reply_list += f"{i+1}. {name}\n"
+    reply_list = "\n".join(f"{i+1}. {r.get('name', 'Untitled')}" for i, r in enumerate(saved_replies))
 
     prompt = (
-        f"Customer's question:\n{last_customer_msg}\n\n"
+        f"Customer's question:\n{customer_message[:500]}\n\n"
         f"Pick the ONE saved reply that BEST answers this question. "
         f"If NONE fit, respond NONE. Respond with ONLY the number or NONE.\n\n"
         f"{reply_list}"
     )
 
     try:
-        answer = call_claude(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=20,
-        )
-
+        answer = call_claude(messages=[{"role": "user", "content": prompt}], max_tokens=20)
         if not answer or answer.upper() == "NONE":
             return None
-
-        # Parse the number
-        try:
-            idx = int(answer.strip().rstrip(".")) - 1
-            if 0 <= idx < len(saved_replies):
-                match = saved_replies[idx]
-                log.info(f"    Saved reply match: \"{match.get('name')}\"")
-                return match
-        except ValueError:
-            pass
-
-        return None
-    except Exception as e:
+        idx = int(answer.strip().rstrip(".")) - 1
+        if 0 <= idx < len(saved_replies):
+            match = saved_replies[idx]
+            log.info(f"    Saved reply match: \"{match.get('name')}\"")
+            return match
+    except (ValueError, Exception) as e:
         log.warning(f"  Error matching saved reply: {e}")
-        return None
+
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Help Scout Docs API (separate API, uses Basic Auth with a Docs API key)
-def list_docs_sites() -> None:
-    """Log all available Docs sites so the user can find the right site ID."""
-    if not HELPSCOUT_DOCS_API_KEY:
-        return
-    try:
-        resp = requests.get(
-            f"{DOCS_BASE}/sites",
-            auth=(HELPSCOUT_DOCS_API_KEY, "X"),
-        )
-        if resp.ok:
-            sites = resp.json().get("sites", {}).get("items", [])
-            if sites:
-                log.info("Available Docs sites:")
-                for site in sites:
-                    log.info(f"    ID: {site.get('id')}  |  Name: \"{site.get('title', 'Untitled')}\"  |  URL: {site.get('subDomain', 'n/a')}")
-                if not HELPSCOUT_DOCS_SITE_ID:
-                    log.warning("  No HELPSCOUT_DOCS_SITE_ID set. Searching ALL sites. Set it to limit to one product.")
-    except Exception as e:
-        log.warning(f"  Could not list Docs sites: {e}")
-
-
+# Help Scout Docs API
 # ---------------------------------------------------------------------------
 def search_docs(query: str, max_results: int = 3) -> list[dict]:
     """Search Help Scout Docs for articles matching the query."""
     if not HELPSCOUT_DOCS_API_KEY:
         return []
-
     try:
         params: dict = {"query": query, "status": "published", "visibility": "public"}
         if HELPSCOUT_DOCS_SITE_ID:
             params["siteId"] = HELPSCOUT_DOCS_SITE_ID
-
         resp = requests.get(
             f"{DOCS_BASE}/search/articles",
             params=params,
@@ -379,8 +314,7 @@ def search_docs(query: str, max_results: int = 3) -> list[dict]:
         if not resp.ok:
             log.warning(f"  Docs search failed ({resp.status_code}): {resp.text[:200]}")
             return []
-        data = resp.json()
-        items = data.get("articles", {}).get("items", [])
+        items = resp.json().get("articles", {}).get("items", [])
         return items[:max_results]
     except Exception as e:
         log.warning(f"  Docs search error: {e}")
@@ -388,10 +322,9 @@ def search_docs(query: str, max_results: int = 3) -> list[dict]:
 
 
 def get_doc_article(article_id: str) -> dict | None:
-    """Fetch the full text of a Docs article by ID. Returns dict with name, url, text."""
+    """Fetch the full text of a Docs article by ID."""
     if not HELPSCOUT_DOCS_API_KEY:
         return None
-
     try:
         resp = requests.get(
             f"{DOCS_BASE}/articles/{article_id}",
@@ -400,62 +333,43 @@ def get_doc_article(article_id: str) -> dict | None:
         if not resp.ok:
             return None
         article = resp.json().get("article", {})
-        text = article.get("text", "")
-        name = article.get("name", "Untitled")
-        url = article.get("publicUrl", "")
-        # Strip HTML from article body
-        clean_text = strip_html(text)
-        # Allow more content for richer context
+        clean_text = strip_html(article.get("text", ""))
         if len(clean_text) > 6000:
             clean_text = clean_text[:6000] + "\n...(article truncated)"
-        return {"name": name, "url": url, "text": clean_text}
+        return {
+            "name": article.get("name", "Untitled"),
+            "url": article.get("publicUrl", ""),
+            "text": clean_text,
+        }
     except Exception as e:
         log.warning(f"  Error fetching article {article_id}: {e}")
         return None
 
 
-def find_relevant_docs(subject: str, thread_history: str) -> str:
-    """
-    Search Help Scout Docs using the customer's latest message.
-    Returns formatted article text to include in Claude's prompt.
-    """
+def find_relevant_docs(customer_message: str, subject: str) -> str:
+    """Search Help Scout Docs and return formatted article context."""
     if not HELPSCOUT_DOCS_API_KEY:
         log.info("  No Docs API key set, skipping docs lookup.")
         return ""
 
-    # Extract the last customer message from the thread history
-    # (thread history format: [CUSTOMER - Name - Date]\nmessage text)
-    last_customer_msg = ""
-    blocks = thread_history.split("\n\n---\n\n")
-    for block in reversed(blocks):
-        if block.strip().startswith("[CUSTOMER"):
-            # Grab just the message body (skip the header line)
-            lines = block.strip().split("\n", 1)
-            if len(lines) > 1:
-                last_customer_msg = lines[1].strip()
-            break
-
-    # Build search queries: prioritize the actual customer message
     search_results = []
     seen_ids: set = set()
 
-    # Primary search: customer's latest message (first 150 chars, cleaned)
-    if last_customer_msg:
-        msg_query = re.sub(r"[^a-zA-Z0-9 ]", " ", last_customer_msg[:150]).strip()
+    # Primary search: customer's actual message
+    if customer_message:
+        msg_query = re.sub(r"[^a-zA-Z0-9 ]", " ", customer_message[:150]).strip()
         if msg_query:
             log.info(f"    Searching docs for: \"{msg_query[:80]}...\"")
-            results = search_docs(msg_query)
-            for item in results:
+            for item in search_docs(msg_query):
                 if item["id"] not in seen_ids:
                     search_results.append(item)
                     seen_ids.add(item["id"])
 
-    # Secondary search: subject line (if it looks meaningful, not "This is a test" etc.)
+    # Secondary search: subject line (if meaningful)
     subject_clean = re.sub(r"[^a-zA-Z0-9 ]", " ", subject).strip()
     generic_subjects = {"test", "this is a test", "help", "question", "hi", "hello", "hey"}
     if subject_clean.lower() not in generic_subjects and len(subject_clean) > 5:
-        results = search_docs(subject_clean, max_results=2)
-        for item in results:
+        for item in search_docs(subject_clean, max_results=2):
             if item["id"] not in seen_ids:
                 search_results.append(item)
                 seen_ids.add(item["id"])
@@ -464,45 +378,22 @@ def find_relevant_docs(subject: str, thread_history: str) -> str:
         log.info("  No relevant docs found.")
         return ""
 
-    # Fetch full article text for top results
-    articles = []
-    for result in search_results[:3]:
-        name = result.get("name", "Untitled")
-        url = result.get("url", "no URL")
-        log.info(f"    Doc match: \"{name}\" - {url}")
-        article_data = get_doc_article(result["id"])
-        if article_data:
-            articles.append(article_data)
-
-    if not articles:
+    # Fetch the single best article (first result is highest relevance)
+    best = search_results[0]
+    log.info(f"    Best doc match: \"{best.get('name', 'Untitled')}\" - {best.get('url', '')}")
+    article = get_doc_article(best["id"])
+    if not article:
         return ""
 
-    log.info(f"  Using {len(articles)} help doc(s) for context.")
-
-    # Format with URLs so Claude can link them in the response
-    parts = []
-    for art in articles:
-        parts.append(
-            f"ARTICLE: {art['name']}\n"
-            f"URL: {art['url']}\n\n"
-            f"{art['text']}"
-        )
-    return "\n\n---\n\n".join(parts)
+    log.info(f"  Using help doc for context.")
+    return f"ARTICLE: {article['name']}\nURL: {article['url']}\n\n{article['text']}"
 
 
 # ---------------------------------------------------------------------------
-# Core logic
+# Conversation processing
 # ---------------------------------------------------------------------------
-def strip_html(text: str) -> str:
-    """Rough HTML-to-plain-text conversion for thread bodies."""
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"</(p|div|li|tr)>", "\n", text, flags=re.IGNORECASE)
-    text = re.sub(r"<[^>]+>", "", text)
-    return html.unescape(text).strip()
-
-
 def get_my_user_id() -> int:
-    """Get the user ID of the authenticated user (resource owner)."""
+    """Get the user ID of the authenticated user."""
     data = hs_get("/users/me")
     user_id = data.get("id")
     log.info(f"Authenticated as: {data.get('firstName', '')} {data.get('lastName', '')} (ID: {user_id})")
@@ -510,10 +401,7 @@ def get_my_user_id() -> int:
 
 
 def get_conversations_needing_reply() -> list[dict]:
-    """
-    Return all active conversations ASSIGNED TO ME where the customer
-    is waiting on a response.
-    """
+    """Return all active conversations assigned to me where the customer is waiting."""
     my_id = get_my_user_id()
 
     params: dict = {"status": "active"}
@@ -525,12 +413,9 @@ def get_conversations_needing_reply() -> list[dict]:
 
     needs_reply = []
     for convo in conversations:
-        # Only process conversations assigned to me
         assignee = convo.get("assignee")
         if not assignee or assignee.get("id") != my_id:
             continue
-
-        # Check if customer is waiting
         if convo.get("customerWaitingSince", {}).get("time"):
             needs_reply.append(convo)
 
@@ -539,17 +424,11 @@ def get_conversations_needing_reply() -> list[dict]:
 
 def get_thread_history(conversation_id: int) -> tuple[str, bool, bool]:
     """
-    Fetch all threads for a conversation and format them for Claude.
+    Fetch all threads for a conversation.
     Returns (formatted_history, agent_has_replied_before, needs_new_draft).
-
-    needs_new_draft is True if:
-      - There is no AI-drafted note on this conversation, OR
-      - The customer's latest message is newer than the last AI-drafted note
     """
     data = hs_get(f"/conversations/{conversation_id}/threads")
     threads = data.get("_embedded", {}).get("threads", [])
-
-    # Sort oldest-first so the conversation reads chronologically
     threads.sort(key=lambda t: t.get("createdAt", ""))
 
     parts = []
@@ -561,15 +440,13 @@ def get_thread_history(conversation_id: int) -> tuple[str, bool, bool]:
         thread_type = t.get("type", "unknown")
         timestamp = t.get("createdAt", "")
 
-        # Track AI-drafted notes (but don't include them in history sent to Claude)
         if thread_type == "note":
-            body = t.get("body", "")
-            if "AI-DRAFTED RESPONSE" in body:
+            if "AI-DRAFTED RESPONSE" in t.get("body", ""):
                 last_ai_note_time = timestamp
             continue
 
         created_by = t.get("createdBy", {})
-        author_type = created_by.get("type", "unknown")  # "customer" or "user"
+        author_type = created_by.get("type", "unknown")
         author_name = f'{created_by.get("first", "")} {created_by.get("last", "")}'.strip()
         body = strip_html(t.get("body", ""))
 
@@ -584,13 +461,12 @@ def get_thread_history(conversation_id: int) -> tuple[str, bool, bool]:
         label = "CUSTOMER" if author_type == "customer" else "AGENT"
         parts.append(f"[{label} - {author_name} - {timestamp}]\n{body}")
 
-    # Determine if we need a new draft
     if not last_ai_note_time:
-        needs_new_draft = True  # No AI note exists yet
+        needs_new_draft = True
     elif last_customer_time > last_ai_note_time:
-        needs_new_draft = True  # Customer replied after the last AI note
+        needs_new_draft = True
     else:
-        needs_new_draft = False  # AI note is still current
+        needs_new_draft = False
 
     return "\n\n---\n\n".join(parts), agent_has_replied, needs_new_draft
 
@@ -624,18 +500,16 @@ def draft_reply_with_claude(
         )
     elif docs_context:
         user_message += (
-            f"Here are relevant articles from our help documentation. Use the "
-            f"article content as your PRIMARY source for answering. Pull specific "
-            f"steps, details, and instructions directly from these docs.\n\n"
-            f"--- HELP DOCS ---\n\n{docs_context}\n\n"
-            f"--- END HELP DOCS ---\n\n"
-            f"IMPORTANT instructions for using these docs:\n"
+            f"Here is a relevant article from our help documentation. Use it as your "
+            f"PRIMARY source for answering. Pull specific steps, details, and "
+            f"instructions directly from this doc.\n\n"
+            f"--- HELP DOC ---\n\n{docs_context}\n\n"
+            f"--- END HELP DOC ---\n\n"
+            f"IMPORTANT:\n"
             f"- Base your answer on the doc content. Be detailed and specific.\n"
-            f"- At the end of your response, link the SINGLE most relevant article "
-            f"naturally, like: \"For more details, check out this guide: [Article Name](URL)\"\n"
-            f"- Only link ONE article, whichever is most helpful for this specific question.\n"
-            f"- Do NOT say things like 'according to our documentation' in the body "
-            f"of your reply. Just use the knowledge naturally, then link at the end.\n\n"
+            f"- At the end of your response, link the article naturally, like: "
+            f"\"For more details, check out this guide: [Article Name](URL)\"\n"
+            f"- Do NOT say 'according to our documentation' in the body of your reply.\n\n"
         )
 
     user_message += (
@@ -662,15 +536,15 @@ def post_note(conversation_id: int, text: str, source_label: str = "") -> None:
     log.info(f"  Posted note on conversation {conversation_id}")
 
 
-
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
 def run() -> None:
     log.info("Starting Help Scout auto-drafter...")
     if DRY_RUN:
         log.info("DRY RUN mode -- drafts will be printed, not posted.")
 
-    # Load saved replies once at startup
     saved_replies = load_saved_replies()
-
     conversations = get_conversations_needing_reply()
     log.info(f"Found {len(conversations)} conversations needing a reply.")
 
@@ -679,7 +553,6 @@ def run() -> None:
         subject = convo.get("subject", "(no subject)")
         log.info(f"Processing #{convo.get('number', '?')}: {subject}")
 
-        # Extract customer first name from conversation data
         primary = convo.get("primaryCustomer", {}) or convo.get("createdBy", {})
         customer_name = primary.get("first", "") or ""
 
@@ -693,9 +566,12 @@ def run() -> None:
                 log.info(f"  Already has an up-to-date AI draft, skipping.")
                 continue
 
+            # Extract customer's latest message once for reuse
+            customer_msg = extract_last_customer_message(history)
+
             # STEP 1: Try to match a saved reply
             saved_reply_text = ""
-            matched_reply = find_best_saved_reply(history, saved_replies)
+            matched_reply = find_best_saved_reply(customer_msg, saved_replies)
             if matched_reply:
                 log.info(f"  Using saved reply: \"{matched_reply.get('name')}\"")
                 saved_reply_text = get_saved_reply_full(matched_reply["id"])
@@ -704,7 +580,7 @@ def run() -> None:
             docs_context = ""
             if not saved_reply_text:
                 log.info(f"  No saved reply match, searching help docs...")
-                docs_context = find_relevant_docs(subject, history)
+                docs_context = find_relevant_docs(customer_msg, subject)
 
             draft = draft_reply_with_claude(
                 subject,
@@ -718,7 +594,7 @@ def run() -> None:
                 log.warning(f"  Claude returned empty draft, skipping.")
                 continue
 
-            # Label the source in the note so you know what it was based on
+            # Label the source in the note
             if saved_reply_text:
                 source_label = f"Based on saved reply: \"{matched_reply.get('name', 'unknown')}\""
             elif docs_context:
