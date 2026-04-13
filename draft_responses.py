@@ -47,6 +47,48 @@ DOCS_BASE = "https://docsapi.helpscout.net/v1"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
 CLAUDE_MODEL = "claude-sonnet-4-20250514"
 
+
+# ---------------------------------------------------------------------------
+# Anthropic API helper with retry logic for rate limits
+# ---------------------------------------------------------------------------
+def call_claude(messages: list[dict], system: str = "", max_tokens: int = 1024) -> str:
+    """
+    Call the Anthropic API with automatic retry on 429 rate limit errors.
+    Returns the text content from Claude's response.
+    """
+    payload: dict = {
+        "model": CLAUDE_MODEL,
+        "max_tokens": max_tokens,
+        "messages": messages,
+    }
+    if system:
+        payload["system"] = system
+
+    for attempt in range(5):
+        resp = requests.post(
+            ANTHROPIC_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
+        if resp.status_code == 429:
+            wait = 2 ** attempt  # 1, 2, 4, 8, 16 seconds
+            log.warning(f"  Rate limited by Anthropic API, waiting {wait}s (attempt {attempt+1}/5)...")
+            time.sleep(wait)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        return "".join(
+            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+        ).strip()
+
+    # If all retries failed
+    log.error("  Exhausted all retries for Anthropic API.")
+    return ""
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
@@ -259,26 +301,12 @@ def find_best_saved_reply(thread_history: str, saved_replies: list[dict]) -> dic
     )
 
     try:
-        resp = requests.post(
-            ANTHROPIC_URL,
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json={
-                "model": CLAUDE_MODEL,
-                "max_tokens": 20,
-                "messages": [{"role": "user", "content": prompt}],
-            },
+        answer = call_claude(
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=20,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        answer = "".join(
-            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
-        ).strip()
 
-        if answer.upper() == "NONE":
+        if not answer or answer.upper() == "NONE":
             return None
 
         # Parse the number
@@ -603,27 +631,11 @@ def draft_reply_with_claude(
         f"Write ONLY the reply body, nothing else."
     )
 
-    resp = requests.post(
-        ANTHROPIC_URL,
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": CLAUDE_MODEL,
-            "max_tokens": 1024,
-            "system": SYSTEM_PROMPT,
-            "messages": [{"role": "user", "content": user_message}],
-        },
+    return call_claude(
+        messages=[{"role": "user", "content": user_message}],
+        system=SYSTEM_PROMPT,
+        max_tokens=1024,
     )
-    resp.raise_for_status()
-    data = resp.json()
-
-    # Extract text from content blocks
-    return "".join(
-        block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
-    ).strip()
 
 
 def post_note(conversation_id: int, text: str, source_label: str = "") -> None:
@@ -719,6 +731,9 @@ def run() -> None:
         except Exception as e:
             log.error(f"  Error processing conversation {convo_id}: {e}")
             continue
+
+        # Small delay between conversations to avoid rate limits
+        time.sleep(2)
 
     log.info("Done.")
 
