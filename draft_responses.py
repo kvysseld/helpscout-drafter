@@ -349,8 +349,8 @@ def get_my_user_id() -> int:
 
 def get_conversations_needing_reply() -> list[dict]:
     """
-    Return active conversations ASSIGNED TO ME where the customer replied
-    within the last 24 hours and is waiting on a response.
+    Return all active conversations ASSIGNED TO ME where the customer
+    is waiting on a response.
     """
     my_id = get_my_user_id()
 
@@ -361,7 +361,6 @@ def get_conversations_needing_reply() -> list[dict]:
     data = hs_get("/conversations", params)
     conversations = data.get("_embedded", {}).get("conversations", [])
 
-    now = datetime.now(timezone.utc)
     needs_reply = []
     for convo in conversations:
         # Only process conversations assigned to me
@@ -370,28 +369,20 @@ def get_conversations_needing_reply() -> list[dict]:
             continue
 
         # Check if customer is waiting
-        waiting_since = convo.get("customerWaitingSince", {}).get("time")
-        if not waiting_since:
-            continue
-
-        # Only include if the customer replied within the last 24 hours
-        try:
-            waiting_dt = datetime.fromisoformat(waiting_since.replace("Z", "+00:00"))
-            hours_waiting = (now - waiting_dt).total_seconds() / 3600
-            if hours_waiting > 24:
-                continue
-        except (ValueError, TypeError):
-            continue
-
-        needs_reply.append(convo)
+        if convo.get("customerWaitingSince", {}).get("time"):
+            needs_reply.append(convo)
 
     return needs_reply
 
 
-def get_thread_history(conversation_id: int) -> tuple[str, bool]:
+def get_thread_history(conversation_id: int) -> tuple[str, bool, bool]:
     """
     Fetch all threads for a conversation and format them for Claude.
-    Returns (formatted_history, agent_has_replied_before).
+    Returns (formatted_history, agent_has_replied_before, needs_new_draft).
+
+    needs_new_draft is True if:
+      - There is no AI-drafted note on this conversation, OR
+      - The customer's latest message is newer than the last AI-drafted note
     """
     data = hs_get(f"/conversations/{conversation_id}/threads")
     threads = data.get("_embedded", {}).get("threads", [])
@@ -401,28 +392,45 @@ def get_thread_history(conversation_id: int) -> tuple[str, bool]:
 
     parts = []
     agent_has_replied = False
+    last_customer_time = ""
+    last_ai_note_time = ""
+
     for t in threads:
         thread_type = t.get("type", "unknown")
-        # Skip internal notes from showing up as conversation context
+        timestamp = t.get("createdAt", "")
+
+        # Track AI-drafted notes (but don't include them in history sent to Claude)
         if thread_type == "note":
+            body = t.get("body", "")
+            if "AI-DRAFTED RESPONSE" in body:
+                last_ai_note_time = timestamp
             continue
 
         created_by = t.get("createdBy", {})
         author_type = created_by.get("type", "unknown")  # "customer" or "user"
         author_name = f'{created_by.get("first", "")} {created_by.get("last", "")}'.strip()
         body = strip_html(t.get("body", ""))
-        timestamp = t.get("createdAt", "")
 
         if not body:
             continue
 
         if author_type == "user":
             agent_has_replied = True
+        elif author_type == "customer":
+            last_customer_time = timestamp
 
         label = "CUSTOMER" if author_type == "customer" else "AGENT"
         parts.append(f"[{label} - {author_name} - {timestamp}]\n{body}")
 
-    return "\n\n---\n\n".join(parts), agent_has_replied
+    # Determine if we need a new draft
+    if not last_ai_note_time:
+        needs_new_draft = True  # No AI note exists yet
+    elif last_customer_time > last_ai_note_time:
+        needs_new_draft = True  # Customer replied after the last AI note
+    else:
+        needs_new_draft = False  # AI note is still current
+
+    return "\n\n---\n\n".join(parts), agent_has_replied, needs_new_draft
 
 
 def draft_reply_with_claude(
@@ -517,9 +525,13 @@ def run() -> None:
         customer_name = primary.get("first", "") or ""
 
         try:
-            history, agent_has_replied = get_thread_history(convo_id)
+            history, agent_has_replied, needs_new_draft = get_thread_history(convo_id)
             if not history:
                 log.warning(f"  No usable threads found, skipping.")
+                continue
+
+            if not needs_new_draft:
+                log.info(f"  Already has an up-to-date AI draft, skipping.")
                 continue
 
             # Search help docs for relevant articles
