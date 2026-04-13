@@ -234,6 +234,23 @@ def extract_last_customer_message(thread_history: str) -> str:
     return ""
 
 
+def parse_confidence_and_draft(raw: str) -> tuple[str, str]:
+    """
+    Parse Claude's response into (confidence_label, draft_body).
+    Expected format: "[READY TO SEND]\n\nHey Sarah..."
+    """
+    confidence = ""
+    draft = raw
+
+    for tag in ["[READY TO SEND]", "[LIGHT EDIT]", "[NEEDS ATTENTION]"]:
+        if raw.strip().startswith(tag):
+            confidence = tag.strip("[]")
+            draft = raw.strip()[len(tag):].strip()
+            break
+
+    return confidence, draft
+
+
 # ---------------------------------------------------------------------------
 # Saved Replies
 # ---------------------------------------------------------------------------
@@ -408,11 +425,22 @@ def get_conversations_needing_reply() -> list[dict]:
     if MAILBOX_ID:
         params["mailbox"] = MAILBOX_ID
 
-    data = hs_get("/conversations", params)
-    conversations = data.get("_embedded", {}).get("conversations", [])
+    # Paginate through all pages of results
+    all_conversations = []
+    page = 1
+    while True:
+        params["page"] = page
+        data = hs_get("/conversations", params)
+        conversations = data.get("_embedded", {}).get("conversations", [])
+        all_conversations.extend(conversations)
+
+        total_pages = data.get("page", {}).get("totalPages", 1)
+        if page >= total_pages:
+            break
+        page += 1
 
     needs_reply = []
-    for convo in conversations:
+    for convo in all_conversations:
         assignee = convo.get("assignee")
         if not assignee or assignee.get("id") != my_id:
             continue
@@ -441,7 +469,7 @@ def get_thread_history(conversation_id: int) -> tuple[str, bool, bool]:
         timestamp = t.get("createdAt", "")
 
         if thread_type == "note":
-            if "AI-DRAFTED RESPONSE" in t.get("body", ""):
+            if "ai-draft" in t.get("body", "") or "AI-DRAFTED RESPONSE" in t.get("body", ""):
                 last_ai_note_time = timestamp
             continue
 
@@ -513,8 +541,17 @@ def draft_reply_with_claude(
         )
 
     user_message += (
-        f"Please draft a reply to the customer's most recent message. "
-        f"Write ONLY the reply body, nothing else."
+        f"Please draft a reply to the customer's most recent message.\n\n"
+        f"FORMAT: Start your response with a confidence tag on its own line, then "
+        f"a blank line, then the reply body. The tag must be one of:\n"
+        f"  [READY TO SEND] - you are confident this draft is accurate and complete\n"
+        f"  [LIGHT EDIT] - mostly good but Kyle should tweak a detail or two\n"
+        f"  [NEEDS ATTENTION] - you are unsure about the answer or the question is complex\n\n"
+        f"Example format:\n"
+        f"[READY TO SEND]\n\n"
+        f"Hey Sarah, Kyle here 👋 Project Manager for Makeovers\n\n"
+        f"Here's how to do that...\n\n"
+        f"Write ONLY the confidence tag and reply body, nothing else."
     )
 
     return call_claude(
@@ -524,12 +561,22 @@ def draft_reply_with_claude(
     )
 
 
-def post_note(conversation_id: int, text: str, source_label: str = "") -> None:
+def post_note(conversation_id: int, text: str, confidence: str = "", source_label: str = "") -> None:
     """Post the draft as an internal note on the conversation."""
-    source_line = f"<br><em>({source_label})</em>" if source_label else ""
+    # Build a compact header line with emoji indicators
+    if confidence == "READY TO SEND":
+        badge = "🟢 Ready to send"
+    elif confidence == "LIGHT EDIT":
+        badge = "🟡 Light edit needed"
+    elif confidence == "NEEDS ATTENTION":
+        badge = "🔴 Needs attention"
+    else:
+        badge = "🤖 AI Draft"
+
+    source_part = f" | <em>{source_label}</em>" if source_label else ""
     note_body = (
-        f"<strong>🤖 AI-DRAFTED RESPONSE (review before sending):</strong>"
-        f"{source_line}"
+        f"<!-- ai-draft -->"
+        f"<strong>{badge}</strong>{source_part}"
         f"<br><br>{text.replace(chr(10), '<br>')}"
     )
     hs_post(f"/conversations/{conversation_id}/notes", {"text": note_body})
@@ -594,23 +641,28 @@ def run() -> None:
                 log.warning(f"  Claude returned empty draft, skipping.")
                 continue
 
+            # Parse confidence label from draft
+            confidence, draft_body = parse_confidence_and_draft(draft)
+            if confidence:
+                log.info(f"  Confidence: {confidence}")
+
             # Label the source in the note
             if saved_reply_text:
-                source_label = f"Based on saved reply: \"{matched_reply.get('name', 'unknown')}\""
+                source_label = f"Saved reply: \"{matched_reply.get('name', 'unknown')}\""
             elif docs_context:
-                source_label = "Based on help docs"
+                source_label = "Help docs"
             else:
-                source_label = "Based on general knowledge"
+                source_label = "General knowledge"
 
             if DRY_RUN:
                 print(f"\n{'='*60}")
                 print(f"CONVERSATION #{convo.get('number')}: {subject}")
-                print(f"[{source_label}]")
+                print(f"[{confidence or 'no label'}] [{source_label}]")
                 print(f"{'='*60}")
-                print(draft)
+                print(draft_body)
                 print()
             else:
-                post_note(convo_id, draft, source_label=source_label)
+                post_note(convo_id, draft_body, confidence=confidence, source_label=source_label)
 
         except Exception as e:
             log.error(f"  Error processing conversation {convo_id}: {e}")
