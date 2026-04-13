@@ -176,6 +176,128 @@ def hs_post(path: str, payload: dict) -> requests.Response:
 
 
 # ---------------------------------------------------------------------------
+# Saved Replies
+# ---------------------------------------------------------------------------
+_saved_replies_cache: list[dict] = []
+
+
+def list_mailboxes() -> None:
+    """Log all available mailboxes so the user can find the right mailbox ID."""
+    try:
+        data = hs_get("/mailboxes")
+        mailboxes = data.get("_embedded", {}).get("mailboxes", [])
+        if mailboxes:
+            log.info("Available mailboxes:")
+            for mb in mailboxes:
+                log.info(f"    ID: {mb.get('id')}  |  Name: \"{mb.get('name')}\"  |  Email: {mb.get('email', 'n/a')}")
+            if not MAILBOX_ID:
+                log.warning("  No HELPSCOUT_MAILBOX_ID set. Saved replies require a mailbox ID.")
+    except Exception as e:
+        log.warning(f"  Could not list mailboxes: {e}")
+
+
+def load_saved_replies() -> list[dict]:
+    """
+    Fetch all saved replies for the configured mailbox.
+    Returns list of {id, name, preview}.
+    """
+    global _saved_replies_cache
+    if not MAILBOX_ID:
+        log.info("  No MAILBOX_ID set, skipping saved replies.")
+        return []
+
+    try:
+        data = hs_get(f"/mailboxes/{MAILBOX_ID}/saved-replies")
+        # The response is a direct list, not embedded
+        replies = data if isinstance(data, list) else data.get("_embedded", {}).get("saved-replies", data)
+        if not isinstance(replies, list):
+            replies = []
+        _saved_replies_cache = replies
+        log.info(f"Loaded {len(replies)} saved replies.")
+        return replies
+    except Exception as e:
+        log.warning(f"  Could not load saved replies: {e}")
+        return []
+
+
+def get_saved_reply_full(reply_id: int) -> str:
+    """Fetch the full HTML body of a saved reply and return as plain text."""
+    if not MAILBOX_ID:
+        return ""
+    try:
+        data = hs_get(f"/mailboxes/{MAILBOX_ID}/saved-replies/{reply_id}")
+        html_text = data.get("text", "")
+        return strip_html(html_text)
+    except Exception as e:
+        log.warning(f"  Could not fetch saved reply {reply_id}: {e}")
+        return ""
+
+
+def find_best_saved_reply(thread_history: str, saved_replies: list[dict]) -> dict | None:
+    """
+    Use Claude to pick the best saved reply for this conversation.
+    Returns the saved reply dict if a good match is found, or None.
+    """
+    if not saved_replies:
+        return None
+
+    # Build a numbered list of saved reply names + previews for Claude
+    reply_list = ""
+    for i, r in enumerate(saved_replies):
+        name = r.get("name", "Untitled")
+        preview = r.get("preview", "")[:150]
+        reply_list += f"{i+1}. \"{name}\" - {preview}\n"
+
+    prompt = (
+        f"Here is a customer support conversation:\n\n"
+        f"{thread_history}\n\n"
+        f"Below is a numbered list of saved replies available. Pick the ONE saved "
+        f"reply that BEST answers the customer's latest question. If NONE of them "
+        f"are a good fit, respond with just the word NONE.\n\n"
+        f"Respond with ONLY the number of the best match, or NONE. Nothing else.\n\n"
+        f"{reply_list}"
+    )
+
+    try:
+        resp = requests.post(
+            ANTHROPIC_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 20,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        answer = "".join(
+            block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"
+        ).strip()
+
+        if answer.upper() == "NONE":
+            return None
+
+        # Parse the number
+        try:
+            idx = int(answer.strip().rstrip(".")) - 1
+            if 0 <= idx < len(saved_replies):
+                match = saved_replies[idx]
+                log.info(f"    Saved reply match: \"{match.get('name')}\"")
+                return match
+        except ValueError:
+            pass
+
+        return None
+    except Exception as e:
+        log.warning(f"  Error matching saved reply: {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Help Scout Docs API (separate API, uses Basic Auth with a Docs API key)
 def list_docs_sites() -> None:
     """Log all available Docs sites so the user can find the right site ID."""
@@ -438,6 +560,7 @@ def draft_reply_with_claude(
     thread_history: str,
     customer_name: str = "",
     is_first_reply: bool = True,
+    saved_reply_text: str = "",
     docs_context: str = "",
 ) -> str:
     """Send the conversation to Claude and get a draft reply."""
@@ -449,7 +572,17 @@ def draft_reply_with_claude(
         f"--- END ---\n\n"
     )
 
-    if docs_context:
+    if saved_reply_text:
+        user_message += (
+            f"We have a SAVED REPLY that matches this customer's question. Use it "
+            f"as the foundation for your response. Personalize it for this specific "
+            f"conversation: adapt the tone, fill in any placeholders, add the customer's "
+            f"name, and adjust details to match what the customer actually asked. "
+            f"Do NOT copy it word-for-word. Make it feel natural and personal.\n\n"
+            f"--- SAVED REPLY ---\n\n{saved_reply_text}\n\n"
+            f"--- END SAVED REPLY ---\n\n"
+        )
+    elif docs_context:
         user_message += (
             f"Here are relevant articles from our help documentation. Use the "
             f"article content as your PRIMARY source for answering. Pull specific "
@@ -493,10 +626,12 @@ def draft_reply_with_claude(
     ).strip()
 
 
-def post_note(conversation_id: int, text: str) -> None:
+def post_note(conversation_id: int, text: str, source_label: str = "") -> None:
     """Post the draft as an internal note on the conversation."""
+    source_line = f"<br><em>({source_label})</em>" if source_label else ""
     note_body = (
         f"<strong>🤖 AI-DRAFTED RESPONSE (review before sending):</strong>"
+        f"{source_line}"
         f"<br><br>{text.replace(chr(10), '<br>')}"
     )
     hs_post(f"/conversations/{conversation_id}/notes", {"text": note_body})
@@ -509,8 +644,12 @@ def run() -> None:
     if DRY_RUN:
         log.info("DRY RUN mode -- drafts will be printed, not posted.")
 
-    # Log available Docs sites (helps identify the right site ID)
+    # Log available mailboxes and Docs sites (helps with setup)
+    list_mailboxes()
     list_docs_sites()
+
+    # Load saved replies once at startup
+    saved_replies = load_saved_replies()
 
     conversations = get_conversations_needing_reply()
     log.info(f"Found {len(conversations)} conversations needing a reply.")
@@ -534,28 +673,48 @@ def run() -> None:
                 log.info(f"  Already has an up-to-date AI draft, skipping.")
                 continue
 
-            # Search help docs for relevant articles
-            docs_context = find_relevant_docs(subject, history)
+            # STEP 1: Try to match a saved reply
+            saved_reply_text = ""
+            matched_reply = find_best_saved_reply(history, saved_replies)
+            if matched_reply:
+                log.info(f"  Using saved reply: \"{matched_reply.get('name')}\"")
+                saved_reply_text = get_saved_reply_full(matched_reply["id"])
+
+            # STEP 2: If no saved reply matched, search help docs
+            docs_context = ""
+            if not saved_reply_text:
+                log.info(f"  No saved reply match, searching help docs...")
+                docs_context = find_relevant_docs(subject, history)
 
             draft = draft_reply_with_claude(
                 subject,
                 history,
                 customer_name=customer_name,
                 is_first_reply=not agent_has_replied,
+                saved_reply_text=saved_reply_text,
                 docs_context=docs_context,
             )
             if not draft:
                 log.warning(f"  Claude returned empty draft, skipping.")
                 continue
 
+            # Label the source in the note so you know what it was based on
+            if saved_reply_text:
+                source_label = f"Based on saved reply: \"{matched_reply.get('name', 'unknown')}\""
+            elif docs_context:
+                source_label = "Based on help docs"
+            else:
+                source_label = "Based on general knowledge"
+
             if DRY_RUN:
                 print(f"\n{'='*60}")
                 print(f"CONVERSATION #{convo.get('number')}: {subject}")
+                print(f"[{source_label}]")
                 print(f"{'='*60}")
                 print(draft)
                 print()
             else:
-                post_note(convo_id, draft)
+                post_note(convo_id, draft, source_label=source_label)
 
         except Exception as e:
             log.error(f"  Error processing conversation {convo_id}: {e}")
