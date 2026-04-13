@@ -30,3 +30,4 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           HELPSCOUT_DOCS_API_KEY: ${{ secrets.HELPSCOUT_DOCS_API_KEY }}
           HELPSCOUT_DOCS_SITE_ID: ${{ secrets.HELPSCOUT_DOCS_SITE_ID }}
+          HELPSCOUT_MAILBOX_ID: ${{ secrets.HELPSCOUT_MAILBOX_ID }}
