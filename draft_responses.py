@@ -540,19 +540,33 @@ def draft_reply_with_claude(
             f"--- SAVED REPLY ---\n\n{saved_reply_text}\n\n"
             f"--- END SAVED REPLY ---\n\n"
         )
-    elif docs_context:
-        user_message += (
-            f"Here is a relevant article from our help documentation. Use it as your "
-            f"PRIMARY source for answering. Pull specific steps, details, and "
-            f"instructions directly from this doc.\n\n"
-            f"--- HELP DOC ---\n\n{docs_context}\n\n"
-            f"--- END HELP DOC ---\n\n"
-            f"IMPORTANT:\n"
-            f"- Base your answer on the doc content. Be detailed and specific.\n"
-            f"- At the end of your response, link the article naturally, like: "
-            f"\"For more details, check out this guide: [Article Name](URL)\"\n"
-            f"- Do NOT say 'according to our documentation' in the body of your reply.\n\n"
-        )
+
+    if docs_context:
+        if saved_reply_text:
+            # Docs supplement the saved reply
+            user_message += (
+                f"Here is also a relevant help doc article for additional context. "
+                f"Use it to fill in details or answer parts of the customer's message "
+                f"that the saved reply doesn't cover.\n\n"
+                f"--- HELP DOC ---\n\n{docs_context}\n\n"
+                f"--- END HELP DOC ---\n\n"
+                f"If the help doc adds useful info beyond the saved reply, link it at "
+                f"the end like: \"For more details, check out this guide: [Article Name](URL)\"\n\n"
+            )
+        else:
+            # Docs are the only source
+            user_message += (
+                f"Here is a relevant article from our help documentation. Use it as your "
+                f"PRIMARY source for answering. Pull specific steps, details, and "
+                f"instructions directly from this doc.\n\n"
+                f"--- HELP DOC ---\n\n{docs_context}\n\n"
+                f"--- END HELP DOC ---\n\n"
+                f"IMPORTANT:\n"
+                f"- Base your answer on the doc content. Be detailed and specific.\n"
+                f"- At the end of your response, link the article naturally, like: "
+                f"\"For more details, check out this guide: [Article Name](URL)\"\n"
+                f"- Do NOT say 'according to our documentation' in the body of your reply.\n\n"
+            )
 
     user_message += (
         f"Please draft a reply to the customer's most recent message.\n\n"
@@ -637,11 +651,8 @@ def run() -> None:
                 log.info(f"  Using saved reply: \"{matched_reply.get('name')}\"")
                 saved_reply_text = get_saved_reply_full(matched_reply["id"])
 
-            # STEP 2: If no saved reply matched, search help docs
-            docs_context = ""
-            if not saved_reply_text:
-                log.info(f"  No saved reply match, searching help docs...")
-                docs_context = find_relevant_docs(customer_msg, subject)
+            # STEP 2: Always search help docs for additional context
+            docs_context = find_relevant_docs(customer_msg, subject)
 
             draft = draft_reply_with_claude(
                 subject,
@@ -661,7 +672,9 @@ def run() -> None:
                 log.info(f"  Confidence: {confidence}")
 
             # Label the source in the note
-            if saved_reply_text:
+            if saved_reply_text and docs_context:
+                source_label = f"Saved reply: \"{matched_reply.get('name', 'unknown')}\" + help docs"
+            elif saved_reply_text:
                 source_label = f"Saved reply: \"{matched_reply.get('name', 'unknown')}\""
             elif docs_context:
                 source_label = "Help docs"
