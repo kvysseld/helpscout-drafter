@@ -234,10 +234,23 @@ def extract_last_customer_message(thread_history: str) -> str:
     return ""
 
 
+def strip_markdown(text: str) -> str:
+    """Remove common markdown formatting from text."""
+    # Bold: **text** or __text__
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    # Italic: *text* or _text_
+    text = re.sub(r"\*(.+?)\*", r"\1", text)
+    text = re.sub(r"(?<!\w)_(.+?)_(?!\w)", r"\1", text)
+    # Headers: ### text
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return text
+
+
 def parse_confidence_and_draft(raw: str) -> tuple[str, str]:
     """
     Parse Claude's response into (confidence_label, draft_body).
-    Expected format: "[READY TO SEND]\n\nHey Sarah..."
+    Also strips any markdown formatting.
     """
     confidence = ""
     draft = raw
@@ -248,6 +261,7 @@ def parse_confidence_and_draft(raw: str) -> tuple[str, str]:
             draft = raw.strip()[len(tag):].strip()
             break
 
+    draft = strip_markdown(draft)
     return confidence, draft
 
 
