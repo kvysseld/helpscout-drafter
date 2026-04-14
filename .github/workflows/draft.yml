@@ -2,9 +2,11 @@ name: Draft Help Scout Replies
 
 on:
   schedule:
-    # 8:50 AM Eastern (12:50 UTC during EDT, 13:50 UTC during EST)
+    # 8:50 AM Eastern (12:50 UTC during EDT)
     - cron: '50 12 * * 1-5'
-    # 12:50 PM Eastern (16:50 UTC during EDT, 17:50 UTC during EST)
+    # 9:10 AM Eastern backup in case 8:50 is skipped
+    - cron: '10 13 * * 1-5'
+    # 12:50 PM Eastern (16:50 UTC during EDT)
     - cron: '50 16 * * 1-5'
   workflow_dispatch:  # Manual "Run" button in GitHub UI
 
