@@ -2,13 +2,18 @@ name: Draft Help Scout Replies
 
 on:
   schedule:
-    # 8:50 AM Eastern (12:50 UTC during EDT)
+    # 8:30 AM Eastern (12:30 UTC during EDT)
+    - cron: '30 12 * * 1-5'
+    # 8:50 AM Eastern backup
     - cron: '50 12 * * 1-5'
-    # 9:10 AM Eastern backup in case 8:50 is skipped
+    # 9:10 AM Eastern backup
     - cron: '10 13 * * 1-5'
     # 12:50 PM Eastern (16:50 UTC during EDT)
     - cron: '50 16 * * 1-5'
   workflow_dispatch:  # Manual "Run" button in GitHub UI
+
+permissions:
+  contents: write
 
 jobs:
   draft:
@@ -34,3 +39,11 @@ jobs:
           HELPSCOUT_DOCS_API_KEY: ${{ secrets.HELPSCOUT_DOCS_API_KEY }}
           HELPSCOUT_DOCS_SITE_ID: ${{ secrets.HELPSCOUT_DOCS_SITE_ID }}
           HELPSCOUT_MAILBOX_ID: ${{ secrets.HELPSCOUT_MAILBOX_ID }}
+
+      - name: Keep repo active
+        run: |
+          date > .last-run
+          git config user.name "Auto-Drafter"
+          git config user.email "actions@github.com"
+          git add .last-run
+          git diff --cached --quiet || git commit -m "Auto-drafter ran $(date -u +%Y-%m-%d)" && git push || true
