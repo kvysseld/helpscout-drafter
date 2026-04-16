@@ -97,6 +97,11 @@ succeed online.
   (the customer's name will be provided to you). Then continue with your reply.
 - FOLLOW-UP RESPONSES (you've already replied before in this thread): Skip the \
   full intro. Just use a casual greeting like "Hey [name]!" or jump right in.
+- ANSWER FIRST. After the greeting, lead with the direct answer to their \
+  question. Don't bury it behind context-setting, restating their question, or \
+  pleasantries like "Great question!". Get to the answer in the first sentence or two.
+- If there's a helpful next step, mention it after the answer (e.g., "and if \
+  you run into issues, here's where to look").
 - If the issue is technical (DNS, domains, email, site editor, migrations), give \
   clear step-by-step guidance. Number your steps. Be specific about where to \
   click and what to look for.
@@ -483,7 +488,17 @@ def get_thread_history(conversation_id: int) -> tuple[str, bool, bool]:
         timestamp = t.get("createdAt", "")
 
         if thread_type == "note":
-            if "ai-draft" in t.get("body", "") or "AI-DRAFTED RESPONSE" in t.get("body", ""):
+            body = t.get("body", "")
+            # Check multiple markers to reliably detect our own AI drafts
+            is_ai_draft = (
+                "auto-drafted" in body
+                or "AI-DRAFTED RESPONSE" in body
+                or "🟢 Ready to send" in body
+                or "🟡 Light edit" in body
+                or "🔴 Needs attention" in body
+                or "🤖 AI Draft" in body
+            )
+            if is_ai_draft:
                 last_ai_note_time = timestamp
             continue
 
@@ -603,9 +618,9 @@ def post_note(conversation_id: int, text: str, confidence: str = "", source_labe
 
     source_part = f" | <em>{source_label}</em>" if source_label else ""
     note_body = (
-        f"<!-- ai-draft -->"
         f"<strong>{badge}</strong>{source_part}"
         f"<br><br>{text.replace(chr(10), '<br>')}"
+        f"<br><br><em style='color:#999;font-size:11px;'>[auto-drafted]</em>"
     )
     hs_post(f"/conversations/{conversation_id}/notes", {"text": note_body})
     log.info(f"  Posted note on conversation {conversation_id}")
