@@ -2,14 +2,24 @@ name: Draft Help Scout Replies
 
 on:
   schedule:
-    # 8:30 AM Eastern (12:30 UTC during EDT)
-    - cron: '30 12 * * 1-5'
-    # 8:50 AM Eastern backup
-    - cron: '50 12 * * 1-5'
-    # 9:10 AM Eastern backup
-    - cron: '10 13 * * 1-5'
-    # 12:50 PM Eastern (16:50 UTC during EDT)
-    - cron: '50 16 * * 1-5'
+    # Every 30 minutes from 7:00 AM to 4:00 PM EDT (11 UTC to 20 UTC)
+    # Weekdays only. GitHub Actions cron uses UTC.
+    - cron: '0 11 * * 1-5'    # 7:00 AM EDT
+    - cron: '0 12 * * 1-5'    # 8:00 AM EDT
+    - cron: '30 12 * * 1-5'   # 8:30 AM EDT
+    - cron: '0 13 * * 1-5'    # 9:00 AM EDT
+    - cron: '30 13 * * 1-5'   # 9:30 AM EDT
+    - cron: '0 14 * * 1-5'    # 10:00 AM EDT
+    - cron: '30 14 * * 1-5'   # 10:30 AM EDT
+    - cron: '0 15 * * 1-5'    # 11:00 AM EDT
+    - cron: '30 15 * * 1-5'   # 11:30 AM EDT
+    - cron: '0 17 * * 1-5'    # 1:00 PM EDT
+    - cron: '30 17 * * 1-5'   # 1:30 PM EDT
+    - cron: '0 18 * * 1-5'    # 2:00 PM EDT
+    - cron: '30 18 * * 1-5'   # 2:30 PM EDT
+    - cron: '0 19 * * 1-5'    # 3:00 PM EDT
+    - cron: '30 19 * * 1-5'   # 3:30 PM EDT
+    - cron: '0 20 * * 1-5'    # 4:00 PM EDT
   workflow_dispatch:  # Manual "Run" button in GitHub UI
 
 permissions:
