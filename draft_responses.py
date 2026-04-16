@@ -40,6 +40,11 @@ HELPSCOUT_DOCS_SITE_ID = os.environ.get("HELPSCOUT_DOCS_SITE_ID", "")
 MAILBOX_ID = os.environ.get("HELPSCOUT_MAILBOX_ID", "")
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
+# Conversations with these subject lines (case-insensitive) will be skipped
+SKIP_SUBJECTS = [
+    "makeover application submitted",
+]
+
 HS_BASE = "https://api.helpscout.net/v2"
 DOCS_BASE = "https://docsapi.helpscout.net/v1"
 ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
@@ -642,6 +647,11 @@ def run() -> None:
         convo_id = convo["id"]
         subject = convo.get("subject", "(no subject)")
         log.info(f"Processing #{convo.get('number', '?')}: {subject}")
+
+        # Skip automated/form conversations
+        if subject.lower().strip() in SKIP_SUBJECTS:
+            log.info(f"  Skipping (subject is in skip list).")
+            continue
 
         primary = convo.get("primaryCustomer", {}) or convo.get("createdBy", {})
         customer_name = primary.get("first", "") or ""
